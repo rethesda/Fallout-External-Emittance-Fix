@@ -1,20 +1,6 @@
 #include "nvse/PluginAPI.h"
-#include <SafeWrite.h>
-#include <GameData.h>
-#include <fstream>
-#include <string>
-
-NVSEInterface* g_nvseInterface{};
-IDebugLog	   gLog("logs\\EEF.log");
-
-bool NVSEPlugin_Query(const NVSEInterface* nvse, PluginInfo* info)
-{
-	info->infoVersion = PluginInfo::kInfoVersion;
-	info->name = "External Emittance Fix";
-	info->version = 120;
-
-	return true;
-}
+#include "GameData.hpp"
+#include <algorithm>
 
 // TLDR
 // Game resets the External Emittance color (Sunlight color of the weather) every time Player moves to a new region.
@@ -24,59 +10,109 @@ bool NVSEPlugin_Query(const NVSEInterface* nvse, PluginInfo* info)
 
 static const TESWeather* pCurrentRegionWeather = nullptr;
 
-TESWeather* __fastcall TESRegion_GetWeather(TESRegion* thiss) {
-	if (thiss->weather) {
-		pCurrentRegionWeather = thiss->weather;
-		return thiss->weather;
+TESWeather* __fastcall TESRegion_GetWeather(TESRegion* apThis) {
+	if (apThis->pCurrentWeather) {
+		pCurrentRegionWeather = apThis->pCurrentWeather;
+		return apThis->pCurrentWeather;
 	}
 	// Pass current weather in case TESRegion has none - game will default to the... default weather otherwise.
-	Sky* pSky = Sky::Get();
+	Sky* pSky = Sky::GetSingleton();
 	if (pSky->pCurrentWeather) {
-		if (!pCurrentRegionWeather) {
+		if (!pCurrentRegionWeather)
 			pCurrentRegionWeather = pSky->pCurrentWeather;
-		}
 		return pSky->pCurrentWeather;
 	}
 	return nullptr;
 }
 
-void __fastcall Sky_FillColorBlendColors(Sky* thiss, void*, Sky::COLOR_BLEND* aColorBlend, const TESWeather* apCurrentWeather, const TESWeather* apLastWeather, int aeColorType, int* aeTime1, int* aeTime2) {
-	const TESWeather* pCurrentNormalWeather = thiss->pCurrentWeather;
-	const TESWeather* pLastNormalWeather = thiss->pLastWeather;
+void __fastcall Sky_FillColorBlendColors(Sky* apThis, void*, Sky::COLOR_BLEND* apColorBlend, const TESWeather* apCurrentWeather, const TESWeather* apLastWeather, uint32_t aeColorType, uint32_t& aeTime1, uint32_t& aeTime2) {
+	const TESWeather* pCurrentNormalWeather = apThis->pCurrentWeather;
+	const TESWeather* pLastNormalWeather = apThis->pLastWeather;
 
 	// May seem like a duplicate from GetWeather, but it's to handle the case where world is first loaded in.
 	// (There's no current weather in Sky or TESRegion, so game creates default one for TESRegion before calling this function.
-	if (!pCurrentRegionWeather) {
+	if (!pCurrentRegionWeather)
 		pCurrentRegionWeather = apCurrentWeather;
-	}
+
 	// Duplicate colors of the TESRegion weather itself in case next checks fail - prevents starting from black
-	aColorBlend->uiRGBVal[2] = apCurrentWeather->uiColorData[4][*aeTime1];
-	aColorBlend->uiRGBVal[3] = apCurrentWeather->uiColorData[4][*aeTime2];
+	apColorBlend->uiRGBVal[2] = apCurrentWeather->uiColorData[4][aeTime1];
+	apColorBlend->uiRGBVal[3] = apCurrentWeather->uiColorData[4][aeTime2];
 
 	// Use blend colors from current Sky weather if it's shared with TESRegion
 	if (pCurrentNormalWeather && (pCurrentRegionWeather == pCurrentNormalWeather)) {
-		aColorBlend->uiRGBVal[2] = pCurrentNormalWeather->uiColorData[4][*aeTime1];
-		aColorBlend->uiRGBVal[3] = pCurrentNormalWeather->uiColorData[4][*aeTime2];
+		apColorBlend->uiRGBVal[2] = pCurrentNormalWeather->uiColorData[4][aeTime1];
+		apColorBlend->uiRGBVal[3] = pCurrentNormalWeather->uiColorData[4][aeTime2];
 	}
 	// Use blend colors from the last known weather from the Sky if it happens to be reused
 	else if (pLastNormalWeather && (pCurrentRegionWeather == pLastNormalWeather)) {
-		aColorBlend->uiRGBVal[2] = pLastNormalWeather->uiColorData[4][*aeTime1];
-		aColorBlend->uiRGBVal[3] = pLastNormalWeather->uiColorData[4][*aeTime2];
+		apColorBlend->uiRGBVal[2] = pLastNormalWeather->uiColorData[4][aeTime1];
+		apColorBlend->uiRGBVal[3] = pLastNormalWeather->uiColorData[4][aeTime2];
 	}
 
 	// Finally, set blend colors for TESRegion weather
-	aColorBlend->uiRGBVal[0] = apCurrentWeather->uiColorData[4][*aeTime1];
-	aColorBlend->uiRGBVal[1] = apCurrentWeather->uiColorData[4][*aeTime2];
+	apColorBlend->uiRGBVal[0] = apCurrentWeather->uiColorData[4][aeTime1];
+	apColorBlend->uiRGBVal[1] = apCurrentWeather->uiColorData[4][aeTime2];
 }
 
-bool NVSEPlugin_Load(NVSEInterface* nvse) {
-	if (!nvse->isEditor) {
-		WriteRelCall(0x551ECE, UInt32(TESRegion_GetWeather));
-		WriteRelCall(0x55215C, UInt32(TESRegion_GetWeather));
 
-		WriteRelCall(0x551F5F, UInt32(Sky_FillColorBlendColors));
-		WriteRelCall(0x552205, UInt32(Sky_FillColorBlendColors));
+CallDetour kUpdateMatColorOrg;
+void __fastcall BSShaderNoLighting_UpdateMaterialColor(void* apThis, void*, BSShaderProperty* apShaderProp, NiMaterialProperty* apMaterialProp) {
+	// Check if Envmap_Light_Fade flag is set. If it is not, call the original function
+	if ((apShaderProp->ulFlags[1] & 0x8000) != 0) {
+		NiColorA* const pMatColor = reinterpret_cast<NiColorA*>(0x1202010);
+
+		// Grab the value of env map scale, use it as an index for the sky color
+		int32_t iColor = static_cast<int32_t>(apShaderProp->fEnvMapScale);
+		float fColorMult = 1.f;
+
+		// Negative values enable emissive mult
+		if (iColor < 0) {
+			iColor = -iColor;
+			fColorMult = apMaterialProp->m_fEmitMult;
+		}
+
+		iColor = std::clamp(iColor, 0, 9);
+
+		const Sky* pSky = Sky::GetSingleton();
+		pMatColor->r = pSky->kColors[iColor].r * fColorMult;
+		pMatColor->g = pSky->kColors[iColor].g * fColorMult;
+		pMatColor->b = pSky->kColors[iColor].b * fColorMult;
+		pMatColor->a = std::min(apShaderProp->fAlpha, 1.f);
 	}
+	else {
+		ThisCall(kUpdateMatColorOrg.GetOverwrittenAddr(), apThis, apShaderProp, apMaterialProp);
+	}
+}
 
+VirtFuncDetour kCreateCloneOrg;
+BSShaderProperty* __fastcall BSShaderNoLightingProperty_CreateClone(BSShaderProperty* apThis, void*, void* apCloneProc) {
+	BSShaderProperty* pClone = ThisCall<BSShaderProperty*>(kCreateCloneOrg.GetOverwrittenAddr(), apThis, apCloneProc);
+	pClone->fEnvMapScale = apThis->fEnvMapScale;
+	return pClone;
+}
+
+EXTERN_DLL_EXPORT bool NVSEPlugin_Query(const NVSEInterface* nvse, PluginInfo* info) {
+	info->infoVersion = PluginInfo::kInfoVersion;
+	info->name = "External Emittance Fix";
+	info->version = 130;
+
+	return !nvse->isEditor;
+}
+
+EXTERN_DLL_EXPORT bool NVSEPlugin_Load(NVSEInterface* nvse) {
+	ReplaceCall(0x551ECE, TESRegion_GetWeather);
+	ReplaceCall(0x55215C, TESRegion_GetWeather);
+
+	ReplaceCall(0x551F5F, Sky_FillColorBlendColors);
+	ReplaceCall(0x552205, Sky_FillColorBlendColors);
+
+	// Bonus feature creep - allows setting BSShaderNoLightingProperty's emissive color to one of the sky colors, by setting the Envmap_Light_Fade flag and using env map scale as an index for the color.
+	// Credit to Xilandro
+	{
+		kUpdateMatColorOrg.ReplaceCall(0xBC9B15, BSShaderNoLighting_UpdateMaterialColor);
+
+		// Fixes the issue with the env map scale not being copied over to the cloned shader property
+		kCreateCloneOrg.ReplaceVirtualFunc(0x10AE6B8, BSShaderNoLightingProperty_CreateClone);
+	}
 	return true;
 }
