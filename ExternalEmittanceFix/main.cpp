@@ -57,8 +57,8 @@ void __fastcall Sky_FillColorBlendColors(Sky* apThis, void*, Sky::COLOR_BLEND* a
 
 CallDetour kUpdateMatColorOrg;
 void __fastcall BSShaderNoLighting_UpdateMaterialColor(void* apThis, void*, BSShaderProperty* apShaderProp, NiMaterialProperty* apMaterialProp) {
-	// Check if Envmap_Light_Fade flag is set. If it is not, call the original function
-	if ((apShaderProp->ulFlags[1] & 0x8000) != 0) {
+	// Check if Unk8 flag is set. If it is not, call the original function
+	if ((apShaderProp->ulFlags[1] & BSShaderProperty::ShaderFlags2::UNK8) != 0) {
 		NiColorA* const pMatColor = reinterpret_cast<NiColorA*>(0x1202010);
 
 		// Grab the value of env map scale, use it as an index for the sky color
@@ -94,7 +94,7 @@ BSShaderProperty* __fastcall BSShaderNoLightingProperty_CreateClone(BSShaderProp
 EXTERN_DLL_EXPORT bool NVSEPlugin_Query(const NVSEInterface* nvse, PluginInfo* info) {
 	info->infoVersion = PluginInfo::kInfoVersion;
 	info->name = "External Emittance Fix";
-	info->version = 130;
+	info->version = 131;
 
 	return !nvse->isEditor;
 }
